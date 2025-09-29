@@ -37,7 +37,7 @@ if [ ! -f ".env" ]; then
         cat > .env << EOF
 # Database Connection URLs
 MONEYBALL_DATABASE_URL=postgresql://username:password@localhost:5432/moneyball
-SNOWFLAKE_DATABASE_URL=snowflake://mb_cdc_validator:USER_PASSWORD@RIB63479/MONEYBALL/public?warehouse=OPENFLOW_WAREHOUSE&role=mb_cdc_validator_role
+SNOWFLAKE_DATABASE_URL=snowflake://mb_cdc_validator:USER_PASSWORD@RIB63479/MONEYBALL/public?warehouse=DUST_WAREHOUSE&role=mb_cdc_validator_role
 
 # Target Tables (comma-separated)
 TARGET_TABLES=companies,transactions,funds,notes,users
