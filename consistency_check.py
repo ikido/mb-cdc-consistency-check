@@ -249,6 +249,9 @@ class ConsistencyChecker:
         """Run only company note analysis (default mode)"""
         log_info("Starting company note analysis...")
         
+        # 0. Table synchronization overview
+        self.analyze_table_synchronization()
+        
         # 1. Global note analysis (total counts and latest timestamps)
         self.analyze_global_note_statistics()
         
@@ -750,6 +753,186 @@ class ConsistencyChecker:
             log_error(f"Error in note mismatch analysis: {e}")
             self.results.append(ValidationResult(
                 check_name="note_mismatch_analysis",
+                status="error",
+                details={"error": str(e)},
+                timestamp=datetime.now()
+            ))
+    
+    def analyze_table_synchronization(self):
+        """Analyze synchronization status of all tables in public schema"""
+        log_info("Analyzing table synchronization across all public schema tables...")
+        
+        try:
+            pg_conn = self.db.get_postgres_connection()
+            sf_conn = self.db.get_snowflake_connection()
+            
+            pg_cursor = pg_conn.cursor()
+            sf_cursor = sf_conn.cursor()
+            
+            # Get all tables in public schema from PostgreSQL
+            log_info("📋 Discovering tables in PostgreSQL public schema...")
+            pg_cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                  AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """)
+            pg_tables = {row[0] for row in pg_cursor.fetchall()}
+            log_info(f"  Found {len(pg_tables)} tables in PostgreSQL public schema")
+            
+            # Get all tables in public schema from Snowflake
+            log_info("📋 Discovering tables in Snowflake public schema...")
+            sf_cursor.execute("""
+                SELECT table_name 
+                FROM MONEYBALL.INFORMATION_SCHEMA.TABLES 
+                WHERE table_schema = 'public' 
+                  AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """)
+            sf_tables = {row[0].lower() for row in sf_cursor.fetchall()}  # Snowflake returns uppercase
+            log_info(f"  Found {len(sf_tables)} tables in Snowflake public schema")
+            
+            # Find common tables and differences
+            common_tables = pg_tables.intersection(sf_tables)
+            pg_only_tables = pg_tables - sf_tables
+            sf_only_tables = sf_tables - pg_tables
+            
+            log_info(f"📊 Table comparison summary:")
+            log_info(f"  Common tables: {len(common_tables)}")
+            log_info(f"  PostgreSQL only: {len(pg_only_tables)}")
+            log_info(f"  Snowflake only: {len(sf_only_tables)}")
+            
+            # Analyze each common table
+            table_sync_results = []
+            
+            for table_name in sorted(common_tables):
+                log_info(f"🔍 Analyzing table: {table_name}")
+                
+                # Get PostgreSQL table info
+                pg_cursor.execute(f"""
+                    SELECT 
+                        COUNT(*) as record_count,
+                        CASE 
+                            WHEN COUNT(*) = 0 THEN NULL
+                            ELSE MAX(GREATEST(
+                                COALESCE(created_at, '1900-01-01'::timestamp),
+                                COALESCE(updated_at, '1900-01-01'::timestamp)
+                            ))
+                        END as latest_timestamp
+                    FROM "{table_name}"
+                """)
+                pg_result = pg_cursor.fetchone()
+                pg_count = pg_result[0] if pg_result else 0
+                pg_latest = pg_result[1] if pg_result else None
+                
+                # Get Snowflake table info
+                sf_cursor.execute(f"""
+                    SELECT 
+                        COUNT(*) as record_count,
+                        CASE 
+                            WHEN COUNT(*) = 0 THEN NULL
+                            ELSE MAX(GREATEST(
+                                COALESCE("created_at", '1900-01-01'::timestamp),
+                                COALESCE("updated_at", '1900-01-01'::timestamp)
+                            ))
+                        END as latest_timestamp
+                    FROM MONEYBALL."public"."{table_name}"
+                    WHERE "_SNOWFLAKE_DELETED" = FALSE
+                """)
+                sf_result = sf_cursor.fetchone()
+                sf_count = sf_result[0] if sf_result else 0
+                sf_latest = sf_result[1] if sf_result else None
+                
+                # Calculate differences
+                count_diff = pg_count - sf_count
+                count_diff_pct = (count_diff / pg_count * 100) if pg_count > 0 else 0
+                
+                # Calculate lag
+                lag_minutes = 0
+                if pg_latest and sf_latest:
+                    # Ensure both timestamps are timezone-aware
+                    if pg_latest.tzinfo is None:
+                        pg_latest = pytz.utc.localize(pg_latest)
+                    if sf_latest.tzinfo is None:
+                        sf_latest = pytz.utc.localize(sf_latest)
+                    
+                    lag_seconds = (pg_latest - sf_latest).total_seconds()
+                    lag_minutes = max(0, lag_seconds / 60)  # Don't show negative lag
+                elif pg_latest and not sf_latest:
+                    lag_minutes = float('inf')
+                
+                # Determine sync status
+                if pg_count == 0 and sf_count == 0:
+                    sync_status = 'empty'
+                elif count_diff == 0 and lag_minutes <= 5:
+                    sync_status = 'perfect'
+                elif abs(count_diff_pct) <= 1 and lag_minutes <= 30:
+                    sync_status = 'good'
+                elif abs(count_diff_pct) <= 5 and lag_minutes <= 60:
+                    sync_status = 'warning'
+                else:
+                    sync_status = 'critical'
+                
+                table_result = {
+                    'table_name': table_name,
+                    'pg_count': pg_count,
+                    'sf_count': sf_count,
+                    'count_diff': count_diff,
+                    'count_diff_pct': count_diff_pct,
+                    'pg_latest': pg_latest,
+                    'sf_latest': sf_latest,
+                    'lag_minutes': lag_minutes,
+                    'sync_status': sync_status
+                }
+                table_sync_results.append(table_result)
+                
+                # Log individual table status
+                lag_str = format_lag_time(lag_minutes) if lag_minutes != float('inf') else "No SF data"
+                log_info(f"  📊 {table_name}: PG={pg_count:,}, SF={sf_count:,}, diff={count_diff:+,} ({count_diff_pct:+.1f}%), lag={lag_str}")
+            
+            # Sort by sync status (worst first) then by count difference
+            status_priority = {'critical': 0, 'warning': 1, 'good': 2, 'perfect': 3, 'empty': 4}
+            table_sync_results.sort(key=lambda x: (status_priority.get(x['sync_status'], 99), -abs(x['count_diff'])))
+            
+            # Determine overall sync status
+            critical_tables = len([t for t in table_sync_results if t['sync_status'] == 'critical'])
+            warning_tables = len([t for t in table_sync_results if t['sync_status'] == 'warning'])
+            total_tables = len(table_sync_results)
+            
+            if critical_tables > 0:
+                overall_status = 'critical'
+            elif warning_tables > 0:
+                overall_status = 'warning'
+            else:
+                overall_status = 'pass'
+            
+            log_info(f"📈 Table synchronization analysis complete:")
+            log_info(f"  Critical: {critical_tables}, Warning: {warning_tables}, Good/Perfect: {total_tables - critical_tables - warning_tables}")
+            log_info(f"  Tables only in PostgreSQL: {list(pg_only_tables) if pg_only_tables else 'None'}")
+            log_info(f"  Tables only in Snowflake: {list(sf_only_tables) if sf_only_tables else 'None'}")
+            log_info(f"📊 Overall table sync status: {overall_status.upper()}")
+            
+            # Store the result
+            self.results.append(ValidationResult(
+                check_name="table_synchronization",
+                status=overall_status,
+                details={
+                    "common_tables_count": len(common_tables),
+                    "pg_only_tables": list(pg_only_tables),
+                    "sf_only_tables": list(sf_only_tables),
+                    "table_results": table_sync_results,
+                    "critical_tables": critical_tables,
+                    "warning_tables": warning_tables,
+                    "total_analyzed": total_tables
+                },
+                timestamp=datetime.now()
+            ))
+            
+        except Exception as e:
+            log_error(f"Error in table synchronization analysis: {e}")
+            self.results.append(ValidationResult(
+                check_name="table_synchronization",
                 status="error",
                 details={"error": str(e)},
                 timestamp=datetime.now()
@@ -1479,6 +1662,86 @@ def generate_markdown_report(results: List[ValidationResult], output_path: str, 
                 for count_result in result.details.get("count_results", []):
                     status_emoji = {"pass": "✅", "warning": "⚠️", "critical": "❌"}[count_result.status]
                     f.write(f"| {count_result.table_name} | {count_result.postgres_count:,} | {count_result.snowflake_count:,} | {count_result.variance_pct:.2f}% | {status_emoji} |\n")
+                
+            elif result.check_name == "table_synchronization":
+                f.write("#### 🔄 Table Synchronization Overview\n\n")
+                
+                details = result.details
+                common_tables = details.get('common_tables_count', 0)
+                pg_only = details.get('pg_only_tables', [])
+                sf_only = details.get('sf_only_tables', [])
+                table_results = details.get('table_results', [])
+                critical_tables = details.get('critical_tables', 0)
+                warning_tables = details.get('warning_tables', 0)
+                
+                # Summary stats
+                f.write("**Summary:**\n")
+                f.write(f"- **Common Tables**: {common_tables}\n")
+                f.write(f"- **PostgreSQL Only**: {len(pg_only)}\n")
+                f.write(f"- **Snowflake Only**: {len(sf_only)}\n")
+                f.write(f"- **Critical Sync Issues**: {critical_tables}\n")
+                f.write(f"- **Warning Sync Issues**: {warning_tables}\n\n")
+                
+                if pg_only:
+                    f.write(f"**⚠️ Tables Only in PostgreSQL**: {', '.join(pg_only)}\n\n")
+                    
+                if sf_only:
+                    f.write(f"**⚠️ Tables Only in Snowflake**: {', '.join(sf_only)}\n\n")
+                
+                # Detailed table comparison
+                if table_results:
+                    f.write("**📊 Table Synchronization Status:**\n\n")
+                    f.write("| Table | PG Records | SF Records | Difference | Difference % | Latest PG | Latest SF | Lag | Status |\n")
+                    f.write("|-------|------------|------------|------------|--------------|-----------|-----------|-----|--------|\n")
+                    
+                    for table in table_results:
+                        table_name = table['table_name']
+                        pg_count = table['pg_count']
+                        sf_count = table['sf_count']
+                        count_diff = table['count_diff']
+                        count_diff_pct = table['count_diff_pct']
+                        pg_latest = table['pg_latest']
+                        sf_latest = table['sf_latest']
+                        lag_minutes = table['lag_minutes']
+                        sync_status = table['sync_status']
+                        
+                        # Format timestamps
+                        pg_time_str = format_timestamp_in_timezone(pg_latest, config or {}) if pg_latest else "None"
+                        sf_time_str = format_timestamp_in_timezone(sf_latest, config or {}) if sf_latest else "None"
+                        
+                        # Format lag
+                        if lag_minutes == float('inf'):
+                            lag_str = "No SF data"
+                        elif lag_minutes == 0:
+                            lag_str = "0 min"
+                        else:
+                            lag_str = format_lag_time(lag_minutes)
+                        
+                        # Status emoji
+                        status_emojis = {
+                            'perfect': '🟢',
+                            'good': '🟡', 
+                            'warning': '🟠',
+                            'critical': '🔴',
+                            'empty': '⚪'
+                        }
+                        status_emoji = status_emojis.get(sync_status, '❓')
+                        
+                        # Format difference with sign
+                        diff_str = f"{count_diff:+,}" if count_diff != 0 else "0"
+                        diff_pct_str = f"{count_diff_pct:+.1f}%" if count_diff_pct != 0 else "0.0%"
+                        
+                        f.write(f"| {table_name} | {pg_count:,} | {sf_count:,} | {diff_str} | {diff_pct_str} | {pg_time_str} | {sf_time_str} | {lag_str} | {status_emoji} |\n")
+                    
+                    # Add legend
+                    f.write(f"\n**Status Legend:**\n")
+                    f.write(f"- 🟢 **Perfect**: Exact match, lag ≤ 5min\n")
+                    f.write(f"- 🟡 **Good**: ≤1% difference, lag ≤ 30min\n")
+                    f.write(f"- 🟠 **Warning**: ≤5% difference, lag ≤ 60min\n")
+                    f.write(f"- 🔴 **Critical**: >5% difference or lag >60min\n")
+                    f.write(f"- ⚪ **Empty**: No records in either database\n")
+                    
+                f.write(f"\n**Status**: {get_status_emoji(result.status)} {result.status.upper()}\n\n")
                 
             elif result.check_name == "note_mismatch_analysis":
                 f.write("#### Note Mismatch Analysis\n\n")
