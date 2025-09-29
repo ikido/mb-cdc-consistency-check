@@ -796,7 +796,19 @@ class ConsistencyChecker:
             # Find common tables and differences
             common_tables = pg_tables.intersection(sf_tables)
             pg_only_tables = pg_tables - sf_tables
-            sf_only_tables = sf_tables - pg_tables
+            
+            # Filter out CDC journal tables from Snowflake-only tables (they're internal CDC metadata)
+            sf_only_tables_filtered = {table for table in (sf_tables - pg_tables) 
+                                     if not (table.endswith('_journal_1757441435_1') or 
+                                           table.endswith('_journal_1757441436_1') or
+                                           table.endswith('_journal_1758702347_1') or
+                                           table.endswith('_journal_1758702348_1') or
+                                           table.endswith('_journal_1758702349_1') or
+                                           table.endswith('_journal_1758702350_1') or
+                                           table.endswith('_journal_1758702351_1') or
+                                           table.endswith('_journal_1758702351_2') or
+                                           '_journal_' in table)}
+            sf_only_tables = sf_only_tables_filtered
             
             log_info(f"📊 Table comparison summary:")
             log_info(f"  Common tables: {len(common_tables)}")
