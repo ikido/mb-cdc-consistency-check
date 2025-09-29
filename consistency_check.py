@@ -313,10 +313,53 @@ class ConsistencyChecker:
                 # Calculate differences
                 note_count_diff = pg_total_notes - sf_total_notes
                 note_count_pct = (note_count_diff / pg_total_notes * 100) if pg_total_notes > 0 else 0
-                company_diff = pg_companies_with_notes - sf_companies_with_notes
+                
+                # Count companies with note discrepancies (consistent with detailed analysis)
+                log_info("📊 Counting companies with note discrepancies...")
+                
+                # Get all companies with their note counts from both databases
+                pg_cursor.execute("""
+                    SELECT 
+                        c.id,
+                        COALESCE(COUNT(n.id), 0) as note_count
+                    FROM companies c
+                    LEFT JOIN notes n ON c.id = n.company_id
+                    GROUP BY c.id
+                """)
+                pg_company_notes = dict(pg_cursor.fetchall())
+                
+                sf_cursor.execute(f"""
+                    SELECT 
+                        c."id",
+                        COALESCE(COUNT(n."id"), 0) as note_count
+                    FROM MONEYBALL."public"."companies" c
+                    LEFT JOIN MONEYBALL."public"."notes" n ON c."id" = n."company_id" 
+                        AND n."_SNOWFLAKE_DELETED" = FALSE
+                    WHERE c."_SNOWFLAKE_DELETED" = FALSE
+                    GROUP BY c."id"
+                """)
+                sf_company_notes = dict(sf_cursor.fetchall())
+                
+                # Count companies with different note counts
+                companies_with_discrepancies = 0
+                all_company_ids = set(pg_company_notes.keys()) | set(sf_company_notes.keys())
+                
+                for company_id in all_company_ids:
+                    pg_note_count = pg_company_notes.get(company_id, 0)
+                    sf_note_count = sf_company_notes.get(company_id, 0)
+                    
+                    # Skip companies with 0 notes in PostgreSQL (as per detailed analysis logic)
+                    if pg_note_count == 0:
+                        continue
+                        
+                    if pg_note_count != sf_note_count:
+                        companies_with_discrepancies += 1
+                
+                # This should match the detailed analysis count
+                company_diff = companies_with_discrepancies
                 
                 log_info(f"📈 Global note count difference: {note_count_diff:,} ({note_count_pct:.1f}% missing from Snowflake)")
-                log_info(f"📈 Companies with notes difference: {company_diff}")
+                log_info(f"📈 Companies with note discrepancies: {company_diff}")
                 
                 # Calculate timestamp lag
                 if pg_latest_note and sf_latest_note:
@@ -1788,7 +1831,7 @@ def generate_markdown_report(results: List[ValidationResult], output_path: str, 
                 f.write("| Metric | PostgreSQL | Snowflake | Difference |\n")
                 f.write("|--------|------------|-----------|------------|\n")
                 f.write(f"| **Total Notes** | {pg_total:,} | {sf_total:,} | {note_diff:,} ({note_pct:.1f}%) |\n")
-                f.write(f"| **Companies with Notes** | {details.get('pg_companies_with_notes', 0)} | {details.get('sf_companies_with_notes', 0)} | {details.get('company_diff', 0)} |\n")
+                f.write(f"| **Companies with Note Discrepancies** | -- | -- | {details.get('company_diff', 0)} |\n")
                 f.write("\n")
                 
                 # Timestamp information
