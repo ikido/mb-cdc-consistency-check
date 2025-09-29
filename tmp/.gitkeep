@@ -1,0 +1,2 @@
+# This file ensures the tmp directory is tracked by git
+# The directory contents are ignored by .gitignore but the directory structure is preserved

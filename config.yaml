@@ -1,0 +1,120 @@
+tables:
+  core_tables:
+    - companies
+    - transactions
+    - funds
+    - notes
+    - users
+  
+validation_rules:
+  count_variance_threshold: 0.01  # 1% tolerance
+  max_lag_minutes: 5
+  sample_size: 100
+  spot_check_accuracy: 0.999
+  top_companies_with_notes: 20
+  skip_detailed_checks_if_perfect_count: true  # Skip fund/transaction lag if 100% count match
+
+company_watchlist:
+  # Companies to always check by name pattern (case insensitive)
+  name_patterns:
+    - "morpho"
+    - "stripe" 
+    - "openai"
+    - "monzo"
+    # Add more company name patterns to monitor
+
+sampling:
+  random_seed: 42
+  min_records_for_sampling: 10
+
+report:
+  formats:
+    - markdown
+  include_raw_data: false
+  max_sample_records_in_report: 10
+
+database_mappings:
+  # Map Postgres table names to Snowflake equivalents
+  postgres_to_snowflake:
+    companies: companies
+    transactions: transactions
+    funds: funds
+    notes: notes
+    users: users
+
+ignore_columns:
+  # Columns to ignore during comparison (CDC and Snowflake-specific)
+  global:
+    - _SNOWFLAKE_DELETED      # CDC soft delete flag
+    - _SNOWFLAKE_INSERTED_AT  # CDC insertion timestamp  
+    - _SNOWFLAKE_UPDATED_AT   # CDC update timestamp
+
+timestamp_columns:
+  # Key timestamp columns for lag analysis by table
+  companies:
+    primary: created_at
+    secondary: [updated_at, actual_created_at, actual_updated_at]
+  
+  notes:
+    primary: created_at
+    secondary: [updated_at, actual_created_at, actual_updated_at, meeting_date]
+  
+  transactions:
+    primary: created_at
+    secondary: [date]
+  
+  funds:
+    primary: created_at
+    secondary: [updated_at]
+  
+  users:
+    primary: created_at
+    secondary: [updated_at]
+
+primary_keys:
+  # Primary key columns for each table (all UUIDs)
+  companies: id
+  notes: id
+  transactions: id
+  funds: id
+  users: id
+
+foreign_key_relationships:
+  # Known relationships for validation
+  notes:
+    user_id: users.id
+    # company_id linkage may require business logic discovery
+  
+  transactions:
+    company_id: companies.id
+
+data_type_mappings:
+  # PostgreSQL → Snowflake type mappings for validation
+  uuid: TEXT
+  "timestamp with time zone": TIMESTAMP_LTZ
+  "character varying": TEXT
+  jsonb: VARIANT
+  boolean: BOOLEAN
+  bigint: NUMBER
+  numeric: NUMBER
+  text: TEXT
+  integer: NUMBER
+  date: DATE
+
+lag_thresholds:
+  # Maximum acceptable lag times by data type
+  general_tables: 5        # minutes
+  company_notes: 2         # minutes for top companies
+  fund_transactions: 3     # minutes
+  user_updates: 5          # minutes
+
+critical_tables:
+  # Tables where discrepancies are considered critical
+  - companies
+  - transactions
+  - funds
+
+# Display settings
+display:
+  timezone: "US/Pacific"  # Timezone for timestamp display (e.g., "US/Pacific", "UTC", "US/Eastern")
+  datetime_format: "%b %d, %Y %H:%M"  # strftime format for timestamp display
